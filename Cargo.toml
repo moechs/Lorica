@@ -64,3 +64,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 
 [profile.bench]
 debug = true
+
+[profile.release]
+debug = false
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
