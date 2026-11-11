@@ -78,14 +78,25 @@ RUN cargo build --release --bin lorica --bin lorica-mcp
 # Stage 3: Minimal runtime image
 FROM debian:bookworm-slim
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates libgssapi-krb5-2 && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libgssapi-krb5-2 \
+        libcap2-bin && \
     rm -rf /var/lib/apt/lists/* && \
-    useradd -r -s /usr/sbin/nologin -d /var/lib/lorica lorica && \
+    groupadd --gid 1000 lorica && \
+    useradd --uid 1000 \
+        --gid lorica \
+        --no-create-home \
+        --home-dir /var/lib/lorica \
+        --shell /usr/sbin/nologin \
+        lorica && \
     mkdir -p /var/lib/lorica && \
     chown lorica:lorica /var/lib/lorica
 
 COPY --from=builder /app/target/release/lorica /usr/bin/lorica
 COPY --from=builder /app/target/release/lorica-mcp /usr/bin/lorica-mcp
+
+RUN setcap 'cap_net_bind_service=+ep' /usr/bin/lorica
 
 USER lorica
 VOLUME /var/lib/lorica
