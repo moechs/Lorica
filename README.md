@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.10.5-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.6-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3702-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3703-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-876-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -159,7 +159,28 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 ## Quick Start
 
-### Install from .deb package
+### Install from the package repository
+
+From 1.10.6 on, each release is also published as a signed apt repository and a signed dnf repository at `https://rwx-g.github.io/Lorica/`, so `apt upgrade` and `dnf upgrade` see new versions. Debian or Ubuntu:
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://rwx-g.github.io/Lorica/lorica-signing-key.asc -o /etc/apt/keyrings/lorica.asc
+sudo curl -fsSL https://rwx-g.github.io/Lorica/apt/lorica.sources -o /etc/apt/sources.list.d/lorica.sources
+sudo apt update && sudo apt install lorica
+```
+
+Fedora or RHEL:
+
+```bash
+sudo curl -fsSL https://rwx-g.github.io/Lorica/lorica-signing-key.asc -o /etc/pki/rpm-gpg/RPM-GPG-KEY-lorica
+sudo curl -fsSL https://rwx-g.github.io/Lorica/rpm/lorica.repo -o /etc/yum.repos.d/lorica.repo
+sudo dnf install lorica
+```
+
+Both trust only the local copy of the key, never one fetched later from the site: check its fingerprint once, after downloading it, with `gpg --show-keys /etc/apt/keyrings/lorica.asc` (or `/etc/pki/rpm-gpg/RPM-GPG-KEY-lorica`). It must be `A7AC4E3D0C999B6DFBA30059B6E37EA916841674`, the project key described in [Package Verification](#package-verification). The repositories hold the latest release only: an older version comes from its release page.
+
+### Install a downloaded package
 
 Download `lorica_<version>_amd64.deb` from the [latest release](https://github.com/Rwx-G/Lorica/releases/latest), then install it with `apt`, which also pulls the GSS-API runtime library the package requires (`libgssapi-krb5-2`); `dpkg -i` does not:
 
@@ -747,7 +768,7 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && pnpm install --frozen-lockfile && pnpm run check && pnpm run lint && pnpm exec vitest run
 ```
 
-At 1.10.5 the two product-crate steps run 3702 Rust tests and the
+At 1.10.6 the two product-crate steps run 3703 Rust tests and the
 forked-crate step 876; the rustls build runs 539 more, most of them the
 default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
 so they are left out of the forked figure. The frontend suite is 794
@@ -909,10 +930,23 @@ curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc 
 gpg --dearmor < lorica-signing-key.asc > lorica.gpg
 gpgv --keyring ./lorica.gpg lorica_<version>_amd64.deb.asc lorica_<version>_amd64.deb
 
-# .rpm
+# .rpm; the define makes a package with no signature fail instead of
+# passing on its digests alone
 sudo rpm --import lorica-signing-key.asc
-rpm --checksig lorica-<version>-1.x86_64.rpm
+rpmkeys --define '_pkgverify_level signature' --checksig lorica-<version>-1.x86_64.rpm
 ```
+
+The `.rpm` of 1.10.1 to 1.10.5 carries a signature only rpm 6 reads (a
+current Fedora, `rpm --version`): on RHEL 9 the command above fails on them,
+and a plain `rpm --checksig` reports their digests alone. Verify those on an
+rpm 6 host. From 1.10.6 on, every `.rpm` carries a signature RHEL 9 reads as
+well.
+
+The package repositories need no manual step: apt checks the signed
+`InRelease` against the key named by `Signed-By` in `lorica.sources`, and dnf
+checks the signed `repomd.xml` and each package's own signature against the
+local key file named by `gpgkey` in `lorica.repo` (`repo_gpgcheck=1`,
+`gpgcheck=1`). A repository signed by any other key is refused.
 
 From v1.7.4 on, the release tag is signed with the same key, so the chain runs
 from the package back to the commit it was built from. Earlier tags are
