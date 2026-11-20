@@ -1,9 +1,14 @@
 name: Build and Push Docker Image
 
+# Triggered by a v* tag, or by a push to ci/docker-publish. The latter is
+# how sync-upstream.yml starts one build after merging a new upstream release.
 on:
   push:
+    branches:
+      - ci/docker-publish
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -85,6 +90,28 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The version comes from the tree, not from a Git tag: a branch push has
+      # no semver tag, and upstream's tag workflow bumps lorica/Cargo.toml
+      # before cutting a release tag.
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' lorica/Cargo.toml | cut -d'"' -f2)"
+          if [[ -z "$version" ]]; then
+            echo "::error::could not read version from lorica/Cargo.toml" >&2
+            exit 1
+          fi
+          major_minor="$(cut -d. -f1-2 <<< "$version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "major_minor=$major_minor" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
       # Derive everything locally: job outputs containing a secret are skipped
       # by the runner, so passing the image name (or its parts) across jobs
       # would silently yield an empty string and invalid "@sha256:..." sources.
@@ -121,8 +148,9 @@ jobs:
         with:
           images: '${{ env.IMAGE_NAME }}'
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.major_minor }}
+            type=raw,value=latest
 
       - name: Create and push manifest
         working-directory: /tmp/digests
