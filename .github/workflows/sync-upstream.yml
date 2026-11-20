@@ -1,0 +1,197 @@
+name: Sync Upstream Release
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/Rwx-G/Lorica.git
+  UP: up
+  UPSTREAM_BRANCH: main
+  MIRROR_BRANCH: upstream
+  DOCKER_BRANCH: ci/docker-publish
+  SYNC_WORKFLOW: .github/workflows/sync-upstream.yml
+  DOCKER_WORKFLOW: .github/workflows/docker-publish.yml
+
+jobs:
+  sync:
+    name: Detect and sync new upstream release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout main with push credentials
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Configure git identity and helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          cat > "$RUNNER_TEMP/lib.sh" <<'EOF'
+          resolve_prefer() {
+            local side="$1" f
+            while IFS= read -r f; do
+              [[ -z "$f" ]] && continue
+              if git checkout "--$side" -- "$f" 2>/dev/null; then
+                git add -- "$f"
+              else
+                git rm -q --force -- "$f"
+              fi
+            done < <(git diff --name-only --diff-filter=U)
+          }
+          EOF
+
+      - name: Fetch upstream and find new release tags
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add "$UP" "$UPSTREAM_URL"
+          git fetch --no-tags "$UP"
+
+          semver='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          semver_sort() { sed 's/-/~/' | LC_ALL=C sort -V -u | sed 's/~/-/'; }
+          list_tags() {
+            git ls-remote --tags "$1" \
+              | grep -v '\^{}' \
+              | sed 's#.*refs/tags/##' \
+              | grep -E "$semver" || true
+          }
+
+          baseline="$(list_tags origin | semver_sort | tail -1)"
+          if [[ -z "$baseline" ]]; then
+            echo "::error::no semver release tag in the fork; refusing to sync" >&2
+            exit 1
+          fi
+
+          list_tags "$UP" | semver_sort > /tmp/upstream-semver
+
+          mapfile -t new_tags < <(
+            { printf '%s\n' "$baseline"; cat /tmp/upstream-semver; } \
+              | semver_sort \
+              | awk -v b="$baseline" '$0 == b { seen = 1; next } seen { print }'
+          )
+
+          if [[ ${#new_tags[@]} -eq 0 ]]; then
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream release newer than $baseline."
+            exit 0
+          fi
+
+          latest="${new_tags[-1]}"
+          git fetch --no-tags "$UP" "+refs/tags/${latest}:refs/upstream-tags/${latest}"
+
+          {
+            echo "has_new=true"
+            echo "baseline=$baseline"
+            echo "latest=$latest"
+          } >> "$GITHUB_OUTPUT"
+          echo "New releases since $baseline: $(paste -sd' ' <<< "${new_tags[*]}")"
+          echo "Syncing latest: $latest"
+
+      - name: Prepare merges locally (nothing is pushed here)
+        id: prepare
+        if: steps.release.outputs.has_new == 'true'
+        shell: bash
+        env:
+          LATEST: ${{ steps.release.outputs.latest }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/lib.sh"
+          latest_ref="refs/upstream-tags/${LATEST}"
+
+          git checkout -B "$DOCKER_BRANCH" "origin/$DOCKER_BRANCH"
+          docker_old="$(git rev-parse HEAD)"
+
+          if ! git merge --no-edit -m "Merge upstream ${LATEST} into ${DOCKER_BRANCH}" "$latest_ref"; then
+            echo "::error::Merging ${LATEST} into ${DOCKER_BRANCH} has conflicts. Nothing was pushed. Resolve it manually (e.g. locally: git checkout ${DOCKER_BRANCH} && git merge ${LATEST}), then push the branch and tag ${LATEST} on it." >&2
+            git diff --name-only --diff-filter=U >&2 || true
+            git merge --abort || true
+            exit 1
+          fi
+          if [[ ! -f "$DOCKER_WORKFLOW" ]]; then
+            echo "::error::$DOCKER_WORKFLOW is missing on ${DOCKER_BRANCH} after merge" >&2
+            exit 1
+          fi
+          docker_new="$(git rev-parse HEAD)"
+
+          git checkout -B main origin/main
+          main_old="$(git rev-parse HEAD)"
+
+          if ! git rebase -X ours --empty=drop "$latest_ref"; then
+            for _ in $(seq 1 20); do
+              [[ -d .git/rebase-merge || -d .git/rebase-apply ]] || break
+              resolve_prefer ours
+              GIT_EDITOR=true git rebase --continue && break || true
+            done
+            if [[ -d .git/rebase-merge || -d .git/rebase-apply ]]; then
+              git rebase --abort
+              echo "::error::rebase of main could not be completed automatically; nothing was pushed" >&2
+              exit 1
+            fi
+          fi
+
+          git merge-base --is-ancestor "$latest_ref" HEAD \
+            || { echo "::error::main is not based on $LATEST" >&2; exit 1; }
+          if [[ -n "$(git rev-list --merges "${latest_ref}..HEAD")" ]]; then
+            echo "::error::unexpected merge commit on main" >&2; exit 1
+          fi
+          if [[ ! -f "$SYNC_WORKFLOW" ]]; then
+            echo "::error::$SYNC_WORKFLOW is missing after rebase" >&2; exit 1
+          fi
+
+          echo "docker: ${docker_old} -> ${docker_new}"
+          echo "main:   ${main_old} -> $(git rev-parse HEAD)"
+          echo "Commits kept on top of ${LATEST} in main:"
+          git log --oneline "${latest_ref}..HEAD"
+
+          echo "main_old=$main_old" >> "$GITHUB_OUTPUT"
+
+      - name: Publish branches, then the tag
+        if: steps.release.outputs.has_new == 'true'
+        shell: bash
+        env:
+          LATEST: ${{ steps.release.outputs.latest }}
+          MAIN_OLD: ${{ steps.prepare.outputs.main_old }}
+        run: |
+          set -euo pipefail
+
+          git push --force origin \
+            "refs/remotes/${UP}/${UPSTREAM_BRANCH}:refs/heads/${MIRROR_BRANCH}"
+
+          git push --force-with-lease="main:${MAIN_OLD}" origin main
+
+          git push origin "$DOCKER_BRANCH"
+
+          git tag "$LATEST" "refs/heads/${DOCKER_BRANCH}"
+          git push origin "refs/tags/${LATEST}"
+
+      - name: Summarize
+        if: steps.release.outputs.has_new == 'true'
+        shell: bash
+        env:
+          LATEST: ${{ steps.release.outputs.latest }}
+        run: |
+          {
+            echo "### Synced upstream ${LATEST}"
+            echo ""
+            echo "- \`${MIRROR_BRANCH}\`: aligned with upstream"
+            echo "- \`main\`: rebased onto \`${LATEST}\` (no merge commit, upstream wins)"
+            echo "- \`${DOCKER_BRANCH}\`: merged \`${LATEST}\` (conflicts abort the run)"
+            echo "- tag \`${LATEST}\` created on \`${DOCKER_BRANCH}\`; the image build is triggered by this tag"
+          } >> "$GITHUB_STEP_SUMMARY"
