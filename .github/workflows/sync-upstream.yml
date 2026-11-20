@@ -1,0 +1,122 @@
+name: Sync Upstream Release
+
+# Checks for new upstream releases and advances the mirror, main and
+# ci/docker-publish together so one build runs per release.
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Detect and sync new upstream release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout main with push credentials
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and find new release tags
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/Rwx-G/Lorica.git
+          git fetch --no-tags upstream
+
+          semver='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+          baseline="$(git ls-remote --tags origin \
+            | grep -v '\^{}' \
+            | sed 's#.*refs/tags/##' \
+            | grep -E "$semver" \
+            | LC_ALL=C sort -V | tail -1 || true)"
+          if [[ -z "$baseline" ]]; then
+            echo "::error::no semver release tag in the fork; refusing to sync" >&2
+            exit 1
+          fi
+
+          git ls-remote --tags upstream \
+            | grep -v '\^{}' \
+            | sed 's#.*refs/tags/##' \
+            | grep -E "$semver" \
+            | LC_ALL=C sort -V -u > /tmp/upstream-semver
+
+          mapfile -t new_tags < <(
+            { printf '%s\n' "$baseline"; cat /tmp/upstream-semver; } \
+              | LC_ALL=C sort -V -u \
+              | awk -v b="$baseline" '$0 == b { seen = 1; next } seen { print }'
+          )
+
+          if [[ ${#new_tags[@]} -eq 0 ]]; then
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream release newer than $baseline."
+            exit 0
+          fi
+
+          printf '%s\n' "${new_tags[@]}" > /tmp/all-new-tags
+          for tag in "${new_tags[@]}"; do
+            git fetch --no-tags upstream "refs/tags/${tag}:refs/tags/${tag}"
+          done
+
+          latest="${new_tags[-1]}"
+          echo "has_new=true" >> "$GITHUB_OUTPUT"
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "New releases since $baseline: $(paste -sd' ' /tmp/all-new-tags)"
+
+      - name: Fast-forward the upstream mirror branch
+        if: steps.release.outputs.has_new == 'true'
+        run: |
+          set -euo pipefail
+          git checkout -B upstream origin/upstream
+          git merge --ff-only upstream/main
+          git push origin upstream
+
+      - name: Merge the release into main
+        if: steps.release.outputs.has_new == 'true'
+        run: |
+          set -euo pipefail
+          git checkout main
+          git merge --no-edit "${{ steps.release.outputs.latest }}"
+          git push origin main
+
+      - name: Merge the release into ci/docker-publish to trigger the image build
+        if: steps.release.outputs.has_new == 'true'
+        run: |
+          set -euo pipefail
+          git checkout -B ci/docker-publish origin/ci/docker-publish
+          git merge --no-edit "${{ steps.release.outputs.latest }}"
+          git push origin ci/docker-publish
+
+      - name: Record new tags in the fork
+        if: steps.release.outputs.has_new == 'true'
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            git push origin "refs/tags/${tag}:refs/tags/${tag}"
+          done < /tmp/all-new-tags
+
+      - name: Summarize
+        if: steps.release.outputs.has_new == 'true'
+        run: |
+          echo "### Synced upstream ${{ steps.release.outputs.latest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The upstream mirror, main and ci/docker-publish were advanced; the image build was triggered by the push to ci/docker-publish." >> "$GITHUB_STEP_SUMMARY"
